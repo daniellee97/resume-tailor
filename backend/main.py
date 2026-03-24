@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import re
 import subprocess
@@ -213,6 +214,51 @@ def try_compile_latex(latex_source: str) -> tuple[bytes | None, int, str | None]
         return pdf_bytes, page_count, None
 
 
+def extract_structured_data(resume_text: str) -> dict:
+    """Extract structured resume data as JSON using LLM."""
+    response = deepseek.chat.completions.create(
+        model="deepseek-chat",
+        max_tokens=2048,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a resume parser. Extract structured data from the resume text and return ONLY valid JSON. "
+                    "No markdown fences, no explanation — just the JSON object."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Extract this resume into a JSON object with exactly these fields:\n"
+                    "{\n"
+                    '  "header": { "name": "", "phone": "", "email": "", "location": "", "linkedin": "", "github": "", "website": "" },\n'
+                    '  "education": [ { "institution": "", "location": "", "degree": "", "startDate": "", "endDate": "", "gpa": "", "bullets": [] } ],\n'
+                    '  "experience": [ { "company": "", "title": "", "location": "", "startDate": "", "endDate": "", "bullets": [] } ],\n'
+                    '  "projects": [ { "name": "", "technologies": "", "startDate": "", "endDate": "", "bullets": [] } ],\n'
+                    '  "skills": ""\n'
+                    "}\n\n"
+                    "Rules:\n"
+                    "- linkedin: just the path like 'linkedin.com/in/username' (no https://)\n"
+                    "- github: just 'github.com/username' (no https://)\n"
+                    "- website: personal site if present (no https://)\n"
+                    "- skills: comma-separated string of all skills\n"
+                    "- bullets: array of bullet point strings (no leading dashes)\n"
+                    "- gpa: empty string if not present\n"
+                    "- Use empty string for missing fields, empty array for missing lists\n\n"
+                    f"Resume:\n\n{resume_text}"
+                ),
+            },
+        ],
+    )
+    raw = strip_fences(response.choices[0].message.content or "{}")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {"header": {"name": "", "phone": "", "email": "", "location": "", "linkedin": "", "github": "", "website": ""}, "education": [], "experience": [], "projects": [], "skills": ""}
+    return data
+
+
 def generate_latex_body(resume_text: str, improvements: str | None = None) -> str:
     """Convert resume text to Jake Gutierrez template body, optionally applying improvements."""
     task = (
@@ -305,10 +351,16 @@ async def analyze_resume(
     )
     analysis = analysis_response.choices[0].message.content or ""
 
-    print("[3/3] Converting resume to LaTeX template...")
-    latex_body = generate_latex_body(resume_text)
+    print("[3/3] Converting resume to LaTeX template and extracting structured data...")
+    latex_body, resume_data = "", {}
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        f_latex = executor.submit(generate_latex_body, resume_text)
+        f_struct = executor.submit(extract_structured_data, resume_text)
+        latex_body = f_latex.result()
+        resume_data = f_struct.result()
 
-    return {"analysis": analysis, "resumeText": resume_text, "latexBody": latex_body}
+    return {"analysis": analysis, "resumeText": resume_text, "latexBody": latex_body, "resumeData": resume_data}
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +382,40 @@ async def compile_preview(latexBody: str = Form(...)):
         media_type="application/pdf",
         headers={"X-Page-Count": str(page_count)},
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/chat  — conversational resume assistant
+# ---------------------------------------------------------------------------
+@app.post("/api/chat")
+async def chat(
+    message: str = Form(...),
+    history: str = Form(...),   # JSON array of {role, content}
+    resumeText: str = Form(...),
+):
+    try:
+        history_list = json.loads(history)
+    except Exception:
+        history_list = []
+
+    response = deepseek.chat.completions.create(
+        model="deepseek-chat",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert career coach and resume advisor. "
+                    "You have the user's resume below for context. "
+                    "Be concise, specific, and actionable. Use markdown formatting.\n\n"
+                    f"Resume:\n{resumeText}"
+                ),
+            },
+            *history_list,
+            {"role": "user", "content": message},
+        ],
+    )
+    return {"content": response.choices[0].message.content or ""}
 
 
 # ---------------------------------------------------------------------------
